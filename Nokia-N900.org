@@ -1,0 +1,276 @@
+* Call and sending SMS from BBDB
+#+srcname: bbdb-nokia-n900
+#+begin_src emacs-lisp
+;;; bbdb-nokia-n900.el --- Send SMS' and make phone calls from
+;;; BBDB in GNU Emacs on the Nokia N900 GNU mobile phone via
+;;; the Nokia N900 dbus interface
+
+;; Copyright (C) 2009 ShiroiKuma
+;;
+;; Author: ShiroiKuma.org
+;; 0.3 2010-04-01-103333 (Thursday)
+;;     Modified bbdb-nokia-n900-sms and bbdb-nokia-n900-call to
+;;     To keep point on the selected record and not move to the
+;;     end of the contact after calling or texting. Not done via
+;;     `save-excursion' as it doesn't work when buffer modified.
+;; Version history:
+;; 0.2 2010-02-27-215000 (Saturday)
+;;     Changed call and send shortcuts to `y' and `x';
+;;     Added bbdb-nokia-n900-sms functionality to send SMS via
+;;     modem AT commands;
+;;     Changed bbdb-nokia-n900-call to work via Emacs dbus,
+;;     not shell dbus-send;
+;; 0.1 First version, 2009-12-19-220000
+;;
+;; This program is free software; you can redistribute it and/or
+;; modify it under the terms of the GNU General Public License as
+;; published by the Free Software Foundation; either version 3 of
+;; the License, or (at your option) any later version.
+;;     
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+;; GNU General Public License for more details.
+;;     
+;; You should have received a copy of the GNU General Public
+;; License along with this program; if not, write to the Free
+;; Software Foundation, Inc., 59 Temple Place - Suite 330, Boston,
+;; MA 02111-1307, USA.
+
+;;; Commentary:
+;;
+
+;;; Installation:
+;;
+;; Add the following to your .emacs file:
+;;
+;; (add-to-list 'load-path X)
+;;
+;; ...where X is the directory path where bbdb-nokia-n900.el is stored.
+;;
+;; (require 'bbdb-nokia-n900)
+;;
+;;; Requirements:
+;;
+;; You MUST have the following setup and working:
+;; (in GNU Emacs)
+;; BBDB
+;;
+;; To call: put point on the phone number in the BBDB database and then:
+;; y
+;; To send and SMS:
+;; x
+
+;;; Code:
+
+;; SMS from BBDB
+(define-key bbdb-mode-map "x" 'bbdb-nokia-n900-sms)
+
+(defun nokia-n900-multibyte-check (text)
+  "Check whether the sms TEXT is UTF-8 or plaintext."
+  (if (and (> (string-bytes text) (length text)))
+      (setq nokia-n900-multibyte t
+; should be 70, but fails if more than 63, something with AT counting octets differently maybe?
+;	    nokia-n900-splitpoint 70)
+	    nokia-n900-splitpoint 63)
+    (setq nokia-n900-multibyte nil
+	  nokia-n900-splitpoint 160)))
+
+(defun nokia-n900-calculate-split-sms-number (text nokia-n900-splitpoint)
+  "Calculate into how many SMSes the TEXT will be split.
+NOKIA-N900-SPLITPOINT is based on whether it is multibyte or not."
+  (+ (/ (length text) nokia-n900-splitpoint)
+     (if (> (- (length text) (* (/ (length text) nokia-n900-splitpoint) nokia-n900-splitpoint)) 0)
+	 1
+       0)))
+
+(defun nokia-n900-split-confirm (text)
+  "Solicit user confirmation if sms TEXT would be split into multiple messages by the operator."
+  (if (> (length text) nokia-n900-splitpoint)
+      (y-or-n-p (concat "Long "
+			  (if nokia-n900-multibyte "UTF-8" "non-UTF-8")
+			  " SMS, will be split and charged as "
+			  (number-to-string (nokia-n900-calculate-split-sms-number text nokia-n900-splitpoint))
+			  " SMSes. Continue? "))
+      ;; if not multibyte, continue without confirmation
+      1))
+
+(defun nokia-n900-send-output-check ()
+  (while (not (buffer-modified-p (get-buffer "*n900-sms-dispatch*")))
+    (sleep-for 0.25))
+  (setq test (with-current-buffer "*n900-sms-dispatch*" (buffer-string)))
+;  (setq test (replace-regexp-in-string ".*\n" "" (replace-regexp-in-string "\r$" "" (replace-regexp-in-string "\r$" "" (replace-regexp-in-string "\n$" "" test)))))
+;  (setq error (replace-regexp-in-string ".*ERROR" "ERROR" (replace-regexp-in-string "ERROR.*" "ERROR" test)))
+  (setq error nil)
+  (while (not (or (equal test "OK") (equal error "ERROR")))
+;    (message test)
+    (message "Sending SMS...")
+    (sleep-for 0.25)
+    (setq test (with-current-buffer "*n900-sms-dispatch*" (buffer-string)))
+    (setq test (replace-regexp-in-string ".*\n" "" (replace-regexp-in-string "\r$" "" (replace-regexp-in-string "\r$" "" (replace-regexp-in-string "\n$" "" test)))))
+    (setq error (replace-regexp-in-string ".*ERROR" "ERROR" (replace-regexp-in-string "ERROR.*" "ERROR" test)))
+    (if (equal error "ERROR")
+	(progn (delete-process "n900-sms-dispatch")
+	       (error "Error, Check the *n900-sms-dispatch* buffer")))))
+
+(defun text2hex (string)
+  "Convert a text STRING to its hex representation string"
+  (mapconcat (lambda (c) (format "%04X" c)) string nil))
+
+(defun nokia-n900-send (number text)
+  "Send an SMS to NUMBER with TEXT."
+   (setq sms-parts (+ (/ (- (length text) 1) nokia-n900-splitpoint) 1))
+   (setq sms-part 1)
+   (if nokia-n900-multibyte
+       (progn
+	 (if (not (get-process "n900-sms-dispatch"))
+	     (progn
+	       (start-process "n900-sms-dispatch" "*n900-sms-dispatch*" "pnatd")
+	       (process-kill-without-query (get-process "n900-sms-dispatch"))))
+	 (display-buffer "*n900-sms-dispatch*")
+	 (while (<= sms-part sms-parts)
+	   (setq test (with-current-buffer "*n900-sms-dispatch*" (buffer-string)))
+	   (sit-for 0.5)
+	   (process-send-string "n900-sms-dispatch" "at\r")
+	   (sit-for 0.5)
+	   (process-send-string "n900-sms-dispatch" "AT+CSCS=\"HEX\"\r")
+	   (sit-for 0.5)
+	   (process-send-string "n900-sms-dispatch" "AT+CSMP=17,167,0,8\r")
+	   (sit-for 0.5)
+	   (process-send-string "n900-sms-dispatch" "at+cmgf=1\r")
+	   (sit-for 0.5)
+	   (process-send-string "n900-sms-dispatch" (concat "at+cmgs=\"" number "\"\r"))
+	   (setq part-text (substring text (* (- sms-part 1) nokia-n900-splitpoint) (if (> (- (* sms-part nokia-n900-splitpoint) 1) (length text)) (length text) (* sms-part nokia-n900-splitpoint))))
+;	   (call-process-shell-command "echo" nil "*uni2ascii*" nil part-text " | uni2ascii -pqs")
+;	   (with-current-buffer "*uni2ascii*" (setq converted-text (replace-regexp-in-string "0x" "" (replace-regexp-in-string "\n" "" (buffer-string)))))
+;	   (kill-buffer "*uni2ascii*")
+;	   (process-send-string "n900-sms-dispatch" (concat converted-text "\C-z"))
+	   (process-send-string "n900-sms-dispatch" (concat (text2hex part-text) "\C-z"))
+	   (sit-for 10)
+	   (setq sms-part (+ sms-part 1)))
+	 (if (> sms-parts 1)
+	     (message (concat (number-to-string sms-parts) " SMSes sent."))
+	   (message "SMS sent.")))
+     (progn
+       (if (not (get-process "n900-sms-dispatch"))
+	   (progn
+	     (start-process "n900-sms-dispatch" "*n900-sms-dispatch*" "pnatd")
+	     (process-kill-without-query (get-process "n900-sms-dispatch"))))
+       (display-buffer "*n900-sms-dispatch*")
+       (while (<= sms-part sms-parts)
+	 (setq test (with-current-buffer "*n900-sms-dispatch*" (buffer-string)))
+	 (sit-for .5)
+	 (process-send-string "n900-sms-dispatch" "at\r")
+	 (sit-for .5)
+	 (process-send-string "n900-sms-dispatch" "at+cmgf=1\r")
+	 (sit-for .5)
+	 (process-send-string "n900-sms-dispatch" (concat "at+cmgs=\"" number "\"\r"))
+	 (sit-for .5)
+	 (process-send-string "n900-sms-dispatch" (substring text (* (- sms-part 1) nokia-n900-splitpoint) (if (> (- (* sms-part nokia-n900-splitpoint) 1) (length text)) (length text) (* sms-part nokia-n900-splitpoint))))
+	 (process-send-string "n900-sms-dispatch" "\C-z")
+	 (sit-for 10)
+	 (setq sms-part (+ sms-part 1)))
+       (if (> sms-parts 1)
+	   (message (concat (number-to-string sms-parts) " SMSes sent."))
+	 (message "SMS sent.")))))
+
+(defun nokia-n900-run-checks-and-send (number text)
+  "Run checks before sending the SMS to NUMBER with TEXT."
+    (when (= (length text) 0)
+      (error "attempt to send an empty SMS"))
+    (when (not number)
+      (error "can't send an SMS without a valid phone number"))
+    ;; determine if SMS is UTF-8 encoded or plaintext
+    (nokia-n900-multibyte-check text)
+    ;; if SMS to be split, require user confirmation to send
+    (if (nokia-n900-split-confirm text)
+	(nokia-n900-send number text)
+      (message "message sending canceled")))
+
+(defun nokia-n900-send-sms-to-number (number text)
+  "Send SMS to NUMBER with TEXT."
+  (interactive "sPhone number: \nsSMS text: \n")
+    (nokia-n900-run-checks-and-send number text))
+
+(defun bbdb-nokia-n900-sms (bbdb-record text &optional date regrind)
+  "Sends SMS and adds a note for today to the current BBDB record.
+Call with a prefix to specify date.
+BBDB-RECORD is the record to modify (default: current).
+TEXT is the note to add for DATE.
+If REGRIND is non-nil, redisplay the BBDB record."
+  (interactive (list (bbdb-current-record t)
+                     (read-string "SMS text: ")
+                     ;; Reading date - more powerful with Planner, but we'll make do if necessary
+                     (if (featurep 'planner)
+                         (if current-prefix-arg (planner-read-date) (planner-today))
+                       (if current-prefix-arg
+                           (read-string "Date (YYYY.MM.DD): ")
+                         (format-time-string "%Y.%m.%dT%T%z")))
+                     t))
+  (let ((field (bbdb-current-field))
+	(position (point)))
+    (if (not (eq 'phone (car field)))
+	(error "Cannot dial %s, not a phone field" (car field)))
+    (let ((location (aref (car (cdr field)) 0))
+	  (name (aref (car (cdr field)) 1)))
+      ;; Cut out +/-/ /(/) from the phone number to be dialed
+      ;; and then send SMS
+      (let ((number (replace-regexp-in-string "-" "" (replace-regexp-in-string " " "" (replace-regexp-in-string "(" "" (replace-regexp-in-string ")" "" name))))))
+	(message "Sending SMS to: %s (%s)" name location)
+	(nokia-n900-send-sms-to-number number text)
+	(bbdb-record-putprop bbdb-record
+			     'contact
+			     (concat date " " (format-time-string "%H:%M:%S %Z" (current-time)) ": SMS: " name ": " text "\n"
+				     (or (bbdb-record-getprop bbdb-record 'contact))))
+	(if regrind
+	    (save-excursion
+	      (set-buffer bbdb-buffer-name)
+	      (bbdb-redisplay-one-record bbdb-record)))))
+    (goto-char position))
+  nil)
+
+;; Call from BBDB
+(define-key bbdb-mode-map "y" 'bbdb-nokia-n900-call)
+(defun bbdb-nokia-n900-call (bbdb-record &optional date regrind)
+  "Calls contact and adds a note for today to the current BBDB record.
+Call with a prefix to specify date.
+BBDB-RECORD is the record to modify (default: current).
+DATE is the date.
+If REGRIND is non-nil, redisplay the BBDB record."
+  (interactive (list (bbdb-current-record t)
+                     ;; Reading date - more powerful with Planner, but we'll make do if necessary
+                     (if (featurep 'planner)
+                         (if current-prefix-arg (planner-read-date) (planner-today))
+                       (if current-prefix-arg
+                           (read-string "Date (YYYY.MM.DD): ")
+                         (format-time-string "%Y.%m.%dT%T%z")))
+                     t))
+  (let ((field (bbdb-current-field))
+	(position (point)))
+    (if (not (eq 'phone (car field)))
+	(error "Cannot dial %s, not a phone field" (car field)))
+    (let ((location (aref (car (cdr field)) 0))
+	  (name (aref (car (cdr field)) 1)))
+      ;; Cut out +/-/ /(/) from the phone number to be dialed
+      ;; and then send SMS
+      (let ((number (replace-regexp-in-string "-" "" (replace-regexp-in-string " " "" (replace-regexp-in-string "(" "" (replace-regexp-in-string ")" "" name)))))
+	    (start-time (format-time-string "%H:%M:%S %Z" (current-time))))
+	(message "Calling: %s (%s)" name location)
+	(dbus-call-method :system "com.nokia.csd.Call" "/com/nokia/csd/call" "com.nokia.csd.Call" "CreateWith" number 0)
+	(let ((end-time (format-time-string "%H:%M:%S %Z" (current-time))))
+	  (bbdb-record-putprop bbdb-record
+			       'contact
+			       (concat date " " start-time " - " end-time ": Phone call: " name  "\n"
+				       (or (bbdb-record-getprop bbdb-record 'contact)))))
+	(if regrind
+	    (save-excursion
+	      (set-buffer bbdb-buffer-name)
+	      (bbdb-redisplay-one-record bbdb-record)))))
+    (goto-char position))
+  nil)
+
+(provide 'bbdb-nokia-n900)
+
+;;; bbdb-nokia-n900.el ends here
+
+#+end_src
